@@ -1,46 +1,116 @@
-name: CMake
-
-on: [push]
-
-env:
-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
-  BUILD_TYPE: Release
-
+name: reLCS conan+cmake
+on:
+  pull_request:
+  push:
+  release:
+    types: published
 jobs:
-  build:
-    # The CMake configure and build commands are platform agnostic and should work equally
-    # well on Windows or Mac.  You can convert this to a matrix build if you need
-    # cross-platform coverage.
-    # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
-    runs-on: ubuntu-latest
-
+  build-cmake:
+    strategy:
+      matrix:
+        include:
+          - os: 'windows-latest'
+            platform: 'gl3'
+            gl3_gfxlib: 'glfw'
+            audio: 'openal'
+#          - os: 'windows-latest'
+#            platform: 'gl3'
+#            gl3_gfxlib: 'sdl2'
+#            audio: 'openal'
+          - os: 'windows-latest'
+            platform: 'd3d9'
+            audio: 'openal'
+#          - os: 'windows-latest'
+#            platform: 'd3d9'
+#            audio: 'miles'
+          - os: 'ubuntu-latest'
+            platform: 'gl3'
+            gl3_gfxlib: 'glfw'
+            audio: 'openal'
+#          - os: 'ubuntu-latest'
+#            platform: 'gl3'
+#            gl3_gfxlib: 'sdl2'
+#            audio: 'openal'
+          - os: 'macos-latest'
+            platform: 'gl3'
+            gl3_gfxlib: 'glfw'
+            audio: 'openal'
+#          - os: 'macos-latest'
+#            platform: 'gl3'
+#            gl3_gfxlib: 'sdl2'
+#            audio: 'openal'
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.platform == 'ps2' || matrix.gl3_gfxlib == 'sdl2' || matrix.audio == 'miles' }}
     steps:
-    - uses: actions/checkout@v2
-
-    - name: Create Build Environment
-      # Some projects don't allow in-source building, so create a separate build directory
-      # We'll use this as our working directory for all subsequent commands
-      run: cmake -E make_directory ${{github.workspace}}/build
-
-    - name: Configure CMake
-      # Use a bash shell so we can use the same syntax for environment variable
-      # access regardless of the host operating system
-      shell: bash
-      working-directory: ${{github.workspace}}/build
-      # Note the current convention is to use the -S and -B options here to specify source 
-      # and build directories, but this is only available with CMake 3.13 and higher.  
-      # The CMake binaries on the Github Actions machines are (as of this writing) 3.12
-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE
-
-    - name: Build
-      working-directory: ${{github.workspace}}/build
-      shell: bash
-      # Execute the build.  You can specify a specific target with "--target <NAME>"
-      run: cmake --build . --config $BUILD_TYPE
-
-    - name: Test
-      working-directory: ${{github.workspace}}/build
-      shell: bash
-      # Execute tests defined by the CMake configuration.  
-      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-      run: ctest -C $BUILD_TYPE
+      - uses: actions/checkout@v2
+        with:
+          submodules: true
+      - name: "Checkout Miles SDK Import Library project"
+        uses: actions/checkout@v2
+        if: ${{ matrix.audio == 'miles' }}
+        with:
+          repository: 'withmorten/re3mss'
+          path: 're3mss'
+      - uses: actions/setup-python@v2
+        with:
+          python-version: '3.x'
+      - name: "Use XCode 11 as default (conan-center-index does not provide XCode 12 binaries at the moment)"
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_11.7.app
+      - name: "Setup conan"
+        run: |
+          python -m pip install conan
+          conan config init
+          conan config set log.print_run_commands=True
+          conan remote add bincrafters https://api.bintray.com/conan/bincrafters/public-conan
+          conan remote add madebr_ps2dev https://api.bintray.com/conan/madebr/ps2dev
+      - name: "Add os=playstation2 + gcc.version=3.2 to .conan/settings.yml"
+        shell: python
+        run: |
+          import os, yaml
+          settings_path = os.path.expanduser("~/.conan/settings.yml")
+          yml = yaml.safe_load(open(settings_path))
+          yml["os"]["playstation2"] = None
+          yml["compiler"]["gcc"]["version"].append("3.2")
+          yml["compiler"]["gcc"]["version"].sort()
+          yaml.safe_dump(yml, open(settings_path, "w"))
+      - name: "Create host profile"
+        shell: bash
+        run: |
+          if test "${{ matrix.platform }}" = "ps2"; then
+            cp vendor/librw/conan/playstation2 host_profile
+          else
+            cp ~/.conan/profiles/default host_profile
+          fi
+      - name: "Export Playstation 2 CMake toolchain conan recipe"
+        run: |
+          conan export vendor/librw/cmake/ps2toolchain ps2dev-cmaketoolchain/master@
+      - name: "Export librw conan recipe"
+        run: |
+          conan export vendor/librw librw/master@
+      - name: "Export Miles SDK conan recipe"
+        if: ${{ matrix.audio == 'miles' }}
+        run: |
+          conan export re3mss miles-sdk/master@
+      - name: "Download/build dependencies (conan install)"
+        run: |
+          conan install ${{ github.workspace }} reLCS/master@ -if build -o reLCS:audio=${{ matrix.audio }} -o librw:platform=${{ matrix.platform }} -o librw:gl3_gfxlib=${{ matrix.gl3_gfxlib || 'glfw' }} --build missing -pr:h ./host_profile -pr:b default -s reLCS:build_type=RelWithDebInfo -s librw:build_type=RelWithDebInfo
+        env:
+          CONAN_SYSREQUIRES_MODE: enabled
+      - name: "Build reLCS (conan build)"
+        run: |
+          conan build ${{ github.workspace }} -if build -bf build -pf package
+      - name: "Package reLCS (conan package)"
+        run: |
+          conan package ${{ github.workspace }} -if build -bf build -pf package
+      - name: "Create binary package (cpack)"
+        working-directory: ./build
+        run: |
+          cpack -C RelWithDebInfo
+      - name: "Archive binary package (github artifacts)"
+        uses: actions/upload-artifact@v2
+        with:
+          name: "${{ matrix.os }}-${{ matrix.platform }}"
+          path: build/*.tar.xz
+          if-no-files-found: error
